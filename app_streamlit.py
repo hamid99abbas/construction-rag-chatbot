@@ -3,8 +3,9 @@ import os
 from pathlib import Path
 import pickle
 from typing import List, Dict
-import zipfile
 import tempfile
+import requests
+from io import BytesIO
 
 # Vector store
 from sentence_transformers import SentenceTransformer
@@ -15,7 +16,13 @@ import numpy as np
 import google.generativeai as genai
 
 # Configuration
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-2.0-flash-exp"
+
+# Vector Database URLs - UPDATE THESE WITH YOUR LINKS
+VECTOR_DB_CONFIG = {
+    "index_url": "",  # Will be set from secrets or user input
+    "metadata_url": "",  # Will be set from secrets or user input
+}
 
 
 class VectorStore:
@@ -32,6 +39,58 @@ class VectorStore:
         if self.model is None:
             with st.spinner("Loading embedding model..."):
                 self.model = SentenceTransformer('all-MiniLM-L6-v2')
+
+    def download_from_url(self, url: str, file_type: str) -> bytes:
+        """Download file from URL"""
+        try:
+            response = requests.get(url, timeout=60)
+            response.raise_for_status()
+            return response.content
+        except Exception as e:
+            st.error(f"Error downloading {file_type}: {str(e)}")
+            return None
+
+    def load_from_urls(self, index_url: str, metadata_url: str):
+        """Load vector store from URLs (Google Drive, Dropbox, etc.)"""
+        try:
+            # Download index file
+            with st.spinner("Downloading vector index..."):
+                index_content = self.download_from_url(index_url, "index.faiss")
+                if not index_content:
+                    return False
+
+            # Download metadata file
+            with st.spinner("Downloading metadata..."):
+                metadata_content = self.download_from_url(metadata_url, "metadata.pkl")
+                if not metadata_content:
+                    return False
+
+            # Save to temporary files and load
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.faiss') as tmp_index:
+                tmp_index.write(index_content)
+                tmp_index_path = tmp_index.name
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pkl') as tmp_meta:
+                tmp_meta.write(metadata_content)
+                tmp_meta_path = tmp_meta.name
+
+            # Load the files
+            self.index = faiss.read_index(tmp_index_path)
+
+            with open(tmp_meta_path, 'rb') as f:
+                data = pickle.load(f)
+                self.chunks = data['chunks']
+                self.metadata = data['metadata']
+
+            # Clean up temp files
+            os.unlink(tmp_index_path)
+            os.unlink(tmp_meta_path)
+
+            return True
+
+        except Exception as e:
+            st.error(f"Error loading vector store: {str(e)}")
+            return False
 
     def load_from_files(self, index_file, metadata_file):
         """Load vector store from uploaded files"""
@@ -83,7 +142,7 @@ class VectorStore:
 
 
 class GeminiLLM:
-    """Interface for Google Gemini Flash 2.5"""
+    """Interface for Google Gemini Flash"""
 
     def __init__(self, api_key: str = None):
         self.api_key = api_key
@@ -237,7 +296,6 @@ def main():
         # API Key Input
         st.subheader("🔑 Gemini API Key")
 
-        # Try to get API key from Streamlit secrets first (for deployment)
         api_key = None
         if "GEMINI_API_KEY" in st.secrets:
             api_key = st.secrets["GEMINI_API_KEY"]
@@ -260,37 +318,109 @@ def main():
 
         st.divider()
 
-        # Vector Store Upload
-        st.subheader("📊 Upload Vector Store")
+        # Vector Store Loading Options
+        st.subheader("📊 Load Vector Database")
 
-        st.info("Upload the vector database files generated from test_rag.py")
+        # Check if URLs are configured in secrets
+        use_urls = False
+        index_url = ""
+        metadata_url = ""
 
-        index_file = st.file_uploader(
-            "Upload index.faiss",
-            type=['faiss'],
-            help="The FAISS index file from vector_store folder"
+        if "VECTOR_INDEX_URL" in st.secrets and "VECTOR_METADATA_URL" in st.secrets:
+            index_url = st.secrets["VECTOR_INDEX_URL"]
+            metadata_url = st.secrets["VECTOR_METADATA_URL"]
+            use_urls = True
+            st.info("📡 Vector DB URLs configured in secrets")
+
+        # Tab selection for loading method
+        load_method = st.radio(
+            "Choose loading method:",
+            ["Auto-download from URLs", "Manual upload"],
+            index=0 if use_urls else 1
         )
 
-        metadata_file = st.file_uploader(
-            "Upload metadata.pkl",
-            type=['pkl'],
-            help="The metadata pickle file"
-        )
+        if load_method == "Auto-download from URLs":
+            st.info("📥 Download vector database from cloud storage")
 
-        if index_file and metadata_file:
-            if st.button("🔄 Load Vector Store", type="primary"):
-                with st.spinner("Loading vector store..."):
-                    vector_store = VectorStore()
-                    vector_store.load_model()
+            # Allow URL input if not in secrets
+            if not use_urls:
+                index_url = st.text_input(
+                    "Index URL (index.faiss)",
+                    placeholder="https://drive.google.com/uc?export=download&id=...",
+                    help="Direct download link to index.faiss"
+                )
+                metadata_url = st.text_input(
+                    "Metadata URL (metadata.pkl)",
+                    placeholder="https://drive.google.com/uc?export=download&id=...",
+                    help="Direct download link to metadata.pkl"
+                )
 
-                    if vector_store.load_from_files(index_file, metadata_file):
-                        st.session_state.vector_store = vector_store
-                        st.session_state.chatbot = RAGChatbot(vector_store, st.session_state.llm)
-                        st.success("✅ Vector store loaded!")
-                        st.rerun()
-                    else:
-                        st.error("❌ Failed to load vector store")
+            if index_url and metadata_url:
+                if st.button("🌐 Download & Load Vector Store", type="primary"):
+                    with st.spinner("Downloading from cloud..."):
+                        vector_store = VectorStore()
+                        vector_store.load_model()
 
+                        if vector_store.load_from_urls(index_url, metadata_url):
+                            st.session_state.vector_store = vector_store
+                            st.session_state.chatbot = RAGChatbot(vector_store, st.session_state.llm)
+                            st.success("✅ Vector store loaded from URLs!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Failed to download vector store")
+            else:
+                st.warning("⚠️ Please provide both URLs")
+
+            # Show guide for getting direct download links
+            with st.expander("📖 How to get direct download links"):
+                st.markdown("""
+                ### Google Drive
+                1. Upload files to Google Drive
+                2. Right-click → Share → Anyone with link
+                3. Get shareable link: `https://drive.google.com/file/d/FILE_ID/view`
+                4. Convert to direct link: `https://drive.google.com/uc?export=download&id=FILE_ID`
+
+                ### Dropbox
+                1. Upload files to Dropbox
+                2. Right-click → Share → Create link
+                3. Change `?dl=0` to `?dl=1` at end of URL
+
+                ### GitHub Releases
+                1. Create a release in your repo
+                2. Attach files as assets
+                3. Use raw download URL
+                """)
+
+        else:  # Manual upload
+            st.info("📤 Upload vector database files manually")
+
+            index_file = st.file_uploader(
+                "Upload index.faiss",
+                type=['faiss'],
+                help="The FAISS index file from vector_store folder"
+            )
+
+            metadata_file = st.file_uploader(
+                "Upload metadata.pkl",
+                type=['pkl'],
+                help="The metadata pickle file"
+            )
+
+            if index_file and metadata_file:
+                if st.button("🔄 Load Vector Store", type="primary"):
+                    with st.spinner("Loading vector store..."):
+                        vector_store = VectorStore()
+                        vector_store.load_model()
+
+                        if vector_store.load_from_files(index_file, metadata_file):
+                            st.session_state.vector_store = vector_store
+                            st.session_state.chatbot = RAGChatbot(vector_store, st.session_state.llm)
+                            st.success("✅ Vector store loaded!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Failed to load vector store")
+
+        # Display vector store stats
         if st.session_state.vector_store:
             st.success("✅ Vector store loaded")
             st.metric("Total Chunks", len(st.session_state.vector_store.chunks))
@@ -328,12 +458,11 @@ def main():
         return
 
     if not st.session_state.vector_store:
-        st.info("ℹ️ Please upload and load the vector store files from the sidebar")
+        st.info("ℹ️ Please load the vector store from the sidebar")
         st.markdown("""
-        ### 📝 How to get vector store files:
-        1. Run `test_rag.py` locally with your documents
-        2. This creates `vector_store/index.faiss` and `metadata.pkl`
-        3. Upload these files in the sidebar
+        ### 📝 Two ways to load:
+        1. **Auto-download**: Provide cloud storage URLs (Google Drive, Dropbox)
+        2. **Manual upload**: Upload files directly
         """)
         return
 
