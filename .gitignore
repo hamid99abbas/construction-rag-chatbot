@@ -1,0 +1,57 @@
+# Streamlit Secrets (IMPORTANT - Never commit API keys!)
+.streamlit/secrets.toml
+
+# Vector Store (Upload manually or use Git LFS)
+vector_store/
+*.faiss
+*.pkl
+chunks_preview.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# Test files
+test_documents/
+*.log
+
+# Temporary files
+*.tmp
+temp/
+tmp/
