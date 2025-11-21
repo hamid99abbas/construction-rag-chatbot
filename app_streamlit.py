@@ -16,7 +16,7 @@ import numpy as np
 import google.generativeai as genai
 
 # Configuration
-MODEL_NAME = "gemini-2.0-flash-exp"
+MODEL_NAME = "gemini-2.0-flash"
 
 # Vector Database URLs - UPDATE THESE WITH YOUR LINKS
 VECTOR_DB_CONFIG = {
