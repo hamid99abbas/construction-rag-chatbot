@@ -21,6 +21,74 @@ import google.generativeai as genai
 MODEL_NAME = "gemini-2.0-flash"
 
 
+class QueryClassifier:
+    """Classify queries as 'excel', 'document', or 'both'"""
+
+    def __init__(self, llm):
+        self.llm = llm
+
+    def classify(self, query: str) -> str:
+        """
+        Classify query into: 'excel', 'document', or 'both'
+        """
+        classification_prompt = f"""You are a query classifier for a construction project assistant.
+
+AVAILABLE DATA SOURCES:
+1. **EXCEL**: Contains cost data, budgets, quantities, rates, pricing, BOQ (Bill of Quantities)
+2. **DOCUMENTS**: Contains specifications, requirements, schedules, procedures, technical details
+
+YOUR TASK: Classify the following query into ONE category:
+- "excel" - if asking about costs, budgets, quantities, rates, pricing, BOQ items
+- "document" - if asking about specifications, requirements, procedures, schedules, technical details
+- "both" - if the query needs information from BOTH sources (e.g., comparing costs with specifications)
+
+QUERY: {query}
+
+RESPOND WITH ONLY ONE WORD: excel, document, or both
+
+CLASSIFICATION:"""
+
+        try:
+            response = self.llm.generate(classification_prompt, stream=False)
+            classification = response.strip().lower()
+
+            # Validate response
+            if classification in ['excel', 'document', 'both']:
+                return classification
+            else:
+                # Default to 'both' if unclear
+                return 'both'
+        except:
+            # Fallback: use keyword matching
+            return self._keyword_classify(query)
+
+    def _keyword_classify(self, query: str) -> str:
+        """Fallback keyword-based classification"""
+        query_lower = query.lower()
+
+        # Excel keywords
+        excel_keywords = ['cost', 'price', 'budget', 'rate', 'quantity', 'amount',
+                          'boq', 'expensive', 'cheap', 'total', 'sum', 'payment',
+                          'billing', 'invoice', 'estimate']
+
+        # Document keywords
+        doc_keywords = ['specification', 'requirement', 'schedule', 'procedure',
+                        'how to', 'process', 'standard', 'guideline', 'safety',
+                        'quality', 'design', 'drawing', 'plan', 'method']
+
+        excel_score = sum(1 for keyword in excel_keywords if keyword in query_lower)
+        doc_score = sum(1 for keyword in doc_keywords if keyword in query_lower)
+
+        if excel_score > 0 and doc_score > 0:
+            return 'both'
+        elif excel_score > doc_score:
+            return 'excel'
+        elif doc_score > excel_score:
+            return 'document'
+        else:
+            return 'both'
+
+
 class VectorStore:
     """Manage embeddings and vector search"""
 
@@ -184,36 +252,48 @@ class UnifiedVectorStore:
 
         return success
 
-    def search_all(self, query: str, k: int = 5, excel_threshold: float = 0.4) -> List[Dict]:
+    def search_by_classification(self, query: str, classification: str, k: int = 5) -> List[Dict]:
         """
-        🔥 PRIORITY SEARCH: Excel FIRST, then Documents
+        Search based on query classification
+        - 'excel': Search only Excel
+        - 'document': Search only Documents
+        - 'both': Search both and combine
         """
-        excel_results = []
-        doc_results = []
+        results = []
 
-        # 🎯 STEP 1: Search Excel FIRST
-        if self.excel_store and self.excel_store.index:
-            excel_results = self.excel_store.search(query, k=k)
+        if classification == 'excel':
+            # Search ONLY Excel
+            if self.excel_store and self.excel_store.index:
+                results = self.excel_store.search(query, k=k)
+                # Enhance with CSV content
+                for result in results:
+                    result['chunk'] = self._load_excel_content(result['metadata'])
 
-            # 🔥 ENHANCE: Add rich content to Excel results
-            for result in excel_results:
-                result['chunk'] = self._load_excel_content(result['metadata'])
+        elif classification == 'document':
+            # Search ONLY Documents
+            if self.document_store and self.document_store.index:
+                results = self.document_store.search(query, k=k)
 
-            # Filter for good Excel matches
-            good_excel = [r for r in excel_results if r['similarity'] > excel_threshold]
+        elif classification == 'both':
+            # Search BOTH sources
+            excel_results = []
+            doc_results = []
 
-            if good_excel:
-                # Excel has good results! Return ONLY Excel data
-                return good_excel[:k]
+            if self.excel_store and self.excel_store.index:
+                excel_results = self.excel_store.search(query, k=k)
+                # Enhance with CSV content
+                for result in excel_results:
+                    result['chunk'] = self._load_excel_content(result['metadata'])
 
-        # 🎯 STEP 2: Excel has no good results, search Documents
-        if self.document_store and self.document_store.index:
-            doc_results = self.document_store.search(query, k=k)
+            if self.document_store and self.document_store.index:
+                doc_results = self.document_store.search(query, k=k)
 
-        # 🎯 STEP 3: Combine results with Excel priority
-        all_results = excel_results + doc_results
-        all_results.sort(key=lambda x: x['similarity'], reverse=True)
-        return all_results[:k]
+            # Combine and sort by similarity
+            results = excel_results + doc_results
+            results.sort(key=lambda x: x['similarity'], reverse=True)
+            results = results[:k]
+
+        return results
 
     def _load_excel_content(self, metadata: Dict) -> str:
         """
@@ -366,14 +446,15 @@ class GeminiLLM:
 
 
 class UnifiedRAGChatbot:
-    """RAG chatbot that searches BOTH sources and picks best results"""
+    """RAG chatbot with query classification"""
 
     def __init__(self, vector_store: UnifiedVectorStore, llm: GeminiLLM):
         self.vector_store = vector_store
         self.llm = llm
+        self.classifier = QueryClassifier(llm)
 
-    def create_unified_prompt(self, query: str, context: List[Dict]) -> str:
-        """Create prompt with context from both sources"""
+    def create_prompt(self, query: str, context: List[Dict], classification: str) -> str:
+        """Create prompt with context"""
 
         doc_context = []
         excel_context = []
@@ -400,16 +481,25 @@ class UnifiedRAGChatbot:
                 context_text += f"\n--- Excel Sheet {i}: {sheet_name} ---\n"
                 context_text += f"{c['chunk']}\n"
 
-        prompt = f"""You are a construction project assistant with access to both project documents and detailed cost data.
+        # Add classification info to prompt
+        source_info = ""
+        if classification == 'excel':
+            source_info = "This query is about COSTS/BUDGET - using Excel data."
+        elif classification == 'document':
+            source_info = "This query is about SPECIFICATIONS/PROCEDURES - using document data."
+        else:
+            source_info = "This query requires BOTH cost and specification data."
+
+        prompt = f"""You are a construction project assistant with access to project documents and cost data.
+
+{source_info}
 
 RULES:
 1. Answer ONLY from the provided context
 2. If not in context, say: "I cannot find this information in the available data."
 3. NEVER make up information
 4. Cite sources (document name or Excel sheet)
-5. For costs/budgets: use Excel data
-6. For specifications/requirements: use documents
-7. You can combine information from BOTH sources when relevant
+5. Be specific and detailed in your answers
 
 AVAILABLE CONTEXT:
 {context_text}
@@ -421,17 +511,35 @@ ANSWER:"""
         return prompt
 
     def ask(self, query: str, num_sources: int = 5):
-        """Process question using unified search across BOTH sources"""
+        """Process question with classification"""
 
-        # This searches BOTH stores and returns best matches from either/both
-        results = self.vector_store.search_all(query, k=num_sources)
+        # Step 1: Classify the query
+        classification = self.classifier.classify(query)
+
+        # Show classification to user
+        classification_emoji = {
+            'excel': '💰',
+            'document': '📄',
+            'both': '🔍'
+        }
+        classification_label = {
+            'excel': 'Cost/Budget Query',
+            'document': 'Specification/Procedure Query',
+            'both': 'Combined Query'
+        }
+
+        yield f"**{classification_emoji[classification]} Classification:** {classification_label[classification]}\n\n"
+
+        # Step 2: Search based on classification
+        results = self.vector_store.search_by_classification(query, classification, k=num_sources)
         filtered_results = [r for r in results if r['similarity'] > 0.3]
 
         if not filtered_results:
             yield "⚠️ No relevant information found in the loaded data."
             return
 
-        prompt = self.create_unified_prompt(query, filtered_results)
+        # Step 3: Generate response
+        prompt = self.create_prompt(query, filtered_results, classification)
 
         for chunk in self.llm.generate(prompt, stream=True):
             yield chunk
@@ -453,8 +561,6 @@ def initialize_session_state():
         st.session_state.sources = {}
     if 'data_loaded' not in st.session_state:
         st.session_state.data_loaded = False
-    if 'excel_threshold' not in st.session_state:
-        st.session_state.excel_threshold = 0.4
 
 
 def auto_load_data():
@@ -547,7 +653,7 @@ def main():
             st.success("✅ Data loaded successfully!")
             st.rerun()
 
-    # Sidebar (minimal - just for stats)
+    # Sidebar
     with st.sidebar:
         st.title("📊 System Status")
 
@@ -562,21 +668,7 @@ def main():
 
             st.metric("Total Searchable Chunks", stats['total_chunks'])
 
-            st.info("💡 **Search Priority:** Excel first (costs/budget), then Documents (specifications/details)")
-
         st.divider()
-
-        # Advanced settings
-        with st.expander("⚙️ Advanced Settings"):
-            excel_threshold = st.slider(
-                "Excel relevance threshold",
-                min_value=0.3,
-                max_value=0.7,
-                value=0.4,
-                step=0.05,
-                help="If Excel results are above this threshold, only Excel is used. Lower = more sensitive to Excel data."
-            )
-            st.session_state.excel_threshold = excel_threshold
 
         if st.button("🗑️ Clear Chat"):
             st.session_state.messages = []
@@ -585,29 +677,25 @@ def main():
 
     # Main content
     st.title("🏗️ Construction Project Assistant")
-    st.markdown("Ask me anything! I search **Excel cost data first**, then project documents if needed.")
+    st.markdown("Ask me anything! I'll automatically classify your query and search the right data source.")
 
-    # Show search strategy
-    with st.expander("ℹ️ How does search work?", expanded=False):
+    # Show classification info
+    with st.expander("ℹ️ How does query classification work?", expanded=False):
         st.markdown("""
-        ### 🎯 Search Priority Strategy:
+        ### 🎯 Intelligent Query Classification:
 
-        1. **Excel First** 🥇
-           - For cost, budget, quantity questions
-           - If Excel has good matches (>40% relevance), only Excel is used
+        The system automatically classifies your question into:
 
-        2. **Documents Second** 🥈
-           - If Excel has no good matches
-           - For specifications, requirements, schedules
+        1. **💰 Cost/Budget Queries** → Searches Excel only
+           - Examples: "What is the cost of scaffolding?", "Total budget for concrete?"
 
-        3. **Combined** 🤝
-           - If Excel has some matches but not great
-           - System combines both with Excel priority
+        2. **📄 Specification/Procedure Queries** → Searches Documents only
+           - Examples: "What are the safety requirements?", "Concrete mixing procedure?"
 
-        **Examples:**
-        - "What is the cost of scaffolding?" → Excel only ✅
-        - "What are the safety requirements?" → Documents only ✅
-        - "Does the budget align with requirements?" → Both sources 🤝
+        3. **🔍 Combined Queries** → Searches Both sources
+           - Examples: "Does the budget align with specifications?", "Cost breakdown by requirement?"
+
+        **The AI automatically determines which source(s) to search based on your question!**
         """)
 
     # Display chat history
@@ -632,31 +720,25 @@ def main():
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
             full_response = ""
+            sources = []
 
-            # Get threshold from session state
-            threshold = st.session_state.get('excel_threshold', 0.4)
-
-            # 🔥 PRIORITY SEARCH: Excel first, then documents
-            sources = st.session_state.unified_store.search_all(prompt, k=5, excel_threshold=threshold)
-            filtered_sources = [s for s in sources if s['similarity'] > 0.3]
-
-            if not filtered_sources:
-                response_text = "⚠️ I cannot find relevant information to answer your question."
-                message_placeholder.markdown(response_text)
-                full_response = response_text
-            else:
-                for chunk in st.session_state.chatbot.ask(prompt, num_sources=5):
+            for chunk in st.session_state.chatbot.ask(prompt, num_sources=5):
+                if isinstance(chunk, list):
+                    # This is the sources list returned at the end
+                    sources = chunk
+                else:
                     full_response += chunk
                     message_placeholder.markdown(full_response + "▌")
 
-                message_placeholder.markdown(full_response)
+            message_placeholder.markdown(full_response)
 
-                with st.expander(f"📚 Sources ({len(filtered_sources)})", expanded=False):
-                    for i, source in enumerate(filtered_sources, 1):
+            if sources:
+                with st.expander(f"📚 Sources ({len(sources)})", expanded=False):
+                    for i, source in enumerate(sources, 1):
                         display_source_card(source, i)
 
                 msg_idx = len(st.session_state.messages)
-                st.session_state.sources[msg_idx] = filtered_sources
+                st.session_state.sources[msg_idx] = sources
 
         st.session_state.messages.append({"role": "assistant", "content": full_response})
 
